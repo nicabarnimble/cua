@@ -620,12 +620,45 @@ fn active_tab_close_proven(
     matches!(selected.as_slice(), [(element, _)] if same_element(*element, tab))
 }
 
+/// Whether the browser's live menu says Command-W closes a tab. A browser in
+/// the background offers Command-W as Close Window (its Close Tab item is
+/// hidden), so the same key would close every tab of the window.
+fn cmd_w_closes_a_tab(pid: i32) -> bool {
+    let combo = crate::tools::menu_equivalent::Combo::parse(&["cmd".to_owned()], "w");
+    combo
+        .and_then(|combo| crate::tools::menu_equivalent::find(pid, &combo))
+        .is_some_and(|item| menu_item_is_close_tab(&item.path, item.enabled))
+}
+
+fn menu_item_is_close_tab(path: &[String], enabled: bool) -> bool {
+    enabled && path.last().is_some_and(|title| title == "Close Tab")
+}
+
+/// Make the approved AX window the app's main and focused window without
+/// raising it, so a browser-handled key goes to it and to no sibling window.
+fn mark_ax_window_main(pid: i32, window_id: u32) {
+    unsafe {
+        let app = crate::ax::bindings::AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        for window in crate::ax::bindings::copy_ax_windows(app) {
+            if crate::ax::bindings::ax_get_window_id(window) == Some(window_id) {
+                let _ = set_bool_attr_true(window, "AXMain");
+                let _ = set_bool_attr_true(window, "AXFocused");
+            }
+            CFRelease(window as CFTypeRef);
+        }
+        CFRelease(app as CFTypeRef);
+    }
+}
+
 /// Close the temporary tab with the browser's close-tab key. The window is
 /// made key inside the browser only, and the proof is re-read after that and
 /// immediately before the key. Returns whether the tab was then seen gone
 /// while its window remained.
 fn close_active_tab_by_key(tab: usize, pid: i32, window_id: u32) -> bool {
-    let sent = with_background_key_window(pid, window_id, || {
+    let proof = || {
         let tree = walk_tree(pid, Some(window_id), None);
         let tabs = tree
             .nodes
@@ -646,6 +679,18 @@ fn close_active_tab_by_key(tab: usize, pid: i32, window_id: u32) -> bool {
             window_id,
         );
         release_actionable_nodes(&tree.nodes);
+        proven && cmd_w_closes_a_tab(pid)
+    };
+    let sent = with_background_key_window(pid, window_id, || {
+        // The browser's own main/focused window decides where the key lands:
+        // mark only the approved window, without raising it.
+        mark_ax_window_main(pid, window_id);
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut proven = proof();
+        while !proven && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            proven = proof();
+        }
         proven && crate::input::keyboard::press_key(pid, "w", &["cmd"]).is_ok()
     });
     if !sent {
@@ -3369,6 +3414,15 @@ mod tests {
             Some(7),
             7
         ));
+    }
+
+    #[test]
+    fn close_tab_key_requires_command_w_to_be_close_tab_not_close_window() {
+        let path = |title: &str| vec!["File".to_owned(), title.to_owned()];
+        assert!(menu_item_is_close_tab(&path("Close Tab"), true));
+        assert!(!menu_item_is_close_tab(&path("Close Window"), true));
+        assert!(!menu_item_is_close_tab(&path("Close Tab"), false));
+        assert!(!menu_item_is_close_tab(&[], true));
     }
 
     #[test]

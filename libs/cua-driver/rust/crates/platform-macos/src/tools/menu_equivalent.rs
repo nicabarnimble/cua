@@ -29,7 +29,7 @@ const MAX_ITEMS: usize = 2000;
 
 /// A hotkey as a menu key equivalent compares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Combo {
+pub(crate) struct Combo {
     shift: bool,
     option: bool,
     control: bool,
@@ -41,7 +41,7 @@ impl Combo {
     /// A combo with Command and one printable base key; `None` for anything
     /// else (no Command, a named key such as `return`), which keeps today's
     /// key-event route.
-    pub(super) fn parse(modifiers: &[String], key: &str) -> Option<Self> {
+    pub(crate) fn parse(modifiers: &[String], key: &str) -> Option<Self> {
         let mut cmd = false;
         let mut combo = Combo {
             shift: false,
@@ -82,7 +82,7 @@ impl Combo {
 
 /// A menu item found for a combo.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MenuMatch {
+pub(crate) struct MenuMatch {
     /// Titles from the menu bar item down to the item.
     pub path: Vec<String>,
     pub enabled: bool,
@@ -91,7 +91,7 @@ pub(super) struct MenuMatch {
 /// Find the item in `pid`'s menu bar whose key equivalent is `combo`. An
 /// enabled match wins over a disabled one with the same equivalent. The
 /// Apple menu is skipped: its commands belong to the system.
-pub(super) fn find(pid: i32, combo: &Combo) -> Option<MenuMatch> {
+pub(crate) fn find(pid: i32, combo: &Combo) -> Option<MenuMatch> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
