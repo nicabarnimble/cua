@@ -464,12 +464,30 @@ fn is_same_element(left: usize, right: usize) -> bool {
     unsafe { CFEqual(left as CFTypeRef, right as CFTypeRef) != 0 }
 }
 
+/// What closes the temporary setup tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    /// The new tab's own exact Close button, closed with AXPress.
+    Button(usize),
+    /// The new tab itself, for a browser whose tab strip exposes no Close
+    /// button. Helium's vertical tab strip draws close controls only on
+    /// hover, so the accessibility tree has none. The tab is closed with the
+    /// browser's own close-tab key, only after [`active_tab_close_proven`].
+    ActiveTab(usize),
+}
+
+/// Whether `descriptor`'s browser may close its temporary tab with the
+/// close-tab key when the tab exposes no Close button.
+fn closes_new_tab_by_key(descriptor: &BrowserSetupDescriptor) -> bool {
+    descriptor.product == BrowserProduct::Helium
+}
+
 fn select_new_tab_close_button(
     before: &[AXNode],
     after: &[AXNode],
     same_element: impl Fn(usize, usize) -> bool,
     descriptor: &BrowserSetupDescriptor,
-) -> Result<Option<usize>, BrowserRefusal> {
+) -> Result<Option<CloseTarget>, BrowserRefusal> {
     let prior_tabs = before
         .iter()
         .filter(|node| node.role == "AXRadioButton" && node.element_index.is_some())
@@ -519,7 +537,10 @@ fn select_new_tab_close_button(
         same_element,
     );
     match close_buttons.as_slice() {
-        [(_, node)] => Ok(Some(node.element_ptr)),
+        [(_, node)] => Ok(Some(CloseTarget::Button(node.element_ptr))),
+        [] if closes_new_tab_by_key(descriptor) => {
+            Ok(Some(CloseTarget::ActiveTab(tab.element_ptr)))
+        }
         [] => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
@@ -537,16 +558,137 @@ fn select_new_tab_close_button(
     }
 }
 
+/// The retained closer for the new tab. `pid` and `window_id` bind the key
+/// route to the approved window.
 fn new_tab_close_button(
     before: &[AXNode],
     after: &[AXNode],
     descriptor: &BrowserSetupDescriptor,
-) -> Result<Option<usize>, BrowserRefusal> {
-    let element = select_new_tab_close_button(before, after, is_same_element, descriptor)?;
-    if let Some(element) = element {
-        unsafe { CFRetain(element as CFTypeRef) };
+    pid: i32,
+    window_id: u32,
+) -> Result<Option<NewTabCloser>, BrowserRefusal> {
+    let target = select_new_tab_close_button(before, after, is_same_element, descriptor)?;
+    Ok(target.map(|target| match target {
+        CloseTarget::Button(element) => {
+            unsafe { CFRetain(element as CFTypeRef) };
+            NewTabCloser::Button(element)
+        }
+        CloseTarget::ActiveTab(tab) => {
+            unsafe { CFRetain(tab as CFTypeRef) };
+            NewTabCloser::ActiveTabKey {
+                tab,
+                pid,
+                window_id,
+            }
+        }
+    }))
+}
+
+/// A retained closer for the temporary setup tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewTabCloser {
+    Button(usize),
+    ActiveTabKey {
+        tab: usize,
+        pid: i32,
+        window_id: u32,
+    },
+}
+
+/// Whether the close-tab key can only close `tab`: the approved window is
+/// the app's focused and main window, it has at least one other tab (so the
+/// key cannot close the window), and `tab` is its one selected tab. Every
+/// tab's selection must be readable.
+fn active_tab_close_proven(
+    tabs: &[(usize, Option<bool>)],
+    tab: usize,
+    same_element: impl Fn(usize, usize) -> bool,
+    focused_window: Option<u32>,
+    main_window: Option<u32>,
+    window_id: u32,
+) -> bool {
+    if focused_window != Some(window_id) || main_window != Some(window_id) || tabs.len() < 2 {
+        return false;
     }
-    Ok(element)
+    if tabs.iter().any(|(_, selected)| selected.is_none()) {
+        return false;
+    }
+    let selected = tabs
+        .iter()
+        .filter(|(_, selected)| *selected == Some(true))
+        .collect::<Vec<_>>();
+    matches!(selected.as_slice(), [(element, _)] if same_element(*element, tab))
+}
+
+/// Close the temporary tab with the browser's close-tab key. The window is
+/// made key inside the browser only, and the proof is re-read after that and
+/// immediately before the key. Returns whether the tab was then seen gone
+/// while its window remained.
+fn close_active_tab_by_key(tab: usize, pid: i32, window_id: u32) -> bool {
+    let sent = with_background_key_window(pid, window_id, || {
+        let tree = walk_tree(pid, Some(window_id), None);
+        let tabs = tree
+            .nodes
+            .iter()
+            .filter(|node| node.role == "AXRadioButton" && node.element_index.is_some())
+            .map(|node| {
+                (node.element_ptr, unsafe {
+                    copy_binary_attr(node.element_ptr as AXUIElementRef, "AXValue")
+                })
+            })
+            .collect::<Vec<_>>();
+        let proven = active_tab_close_proven(
+            &tabs,
+            tab,
+            is_same_element,
+            crate::ax::bindings::focused_window_id_of_pid(pid).map(|id| id.own),
+            crate::ax::bindings::main_window_id_of_pid(pid).map(|id| id.own),
+            window_id,
+        );
+        release_actionable_nodes(&tree.nodes);
+        proven && crate::input::keyboard::press_key(pid, "w", &["cmd"]).is_ok()
+    });
+    if !sent {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let tree = walk_tree(pid, Some(window_id), None);
+        let window_present = tree.nodes.iter().any(|node| node.role == "AXWindow");
+        let tab_present = tree.nodes.iter().any(|node| {
+            node.role == "AXRadioButton"
+                && node.element_index.is_some()
+                && is_same_element(node.element_ptr, tab)
+        });
+        release_actionable_nodes(&tree.nodes);
+        if window_present && !tab_present {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Close the temporary tab and release the closer. The closer is consumed.
+fn press_closer(closer: NewTabCloser) -> bool {
+    match closer {
+        NewTabCloser::Button(element) => {
+            let result = unsafe { perform_action(element as AXUIElementRef, "AXPress") };
+            unsafe { CFRelease(element as CFTypeRef) };
+            result == kAXErrorSuccess
+        }
+        NewTabCloser::ActiveTabKey {
+            tab,
+            pid,
+            window_id,
+        } => {
+            let closed = close_active_tab_by_key(tab, pid, window_id);
+            unsafe { CFRelease(tab as CFTypeRef) };
+            closed
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1156,7 +1298,7 @@ fn checkbox_state(value: Option<bool>) -> Result<CheckboxState, BrowserRefusal> 
 
 pub struct SetupUiHandle {
     descriptor: &'static BrowserSetupDescriptor,
-    close_button: Option<usize>,
+    closer: Option<NewTabCloser>,
     enable_attempted: bool,
     trusted_checkbox_fallback_attempted: bool,
     pixel_checkbox_attempts: u8,
@@ -1345,12 +1487,10 @@ impl SetupUiHandle {
         pid: i32,
         window_id: u32,
     ) -> Result<Option<bool>, BrowserRefusal> {
-        let Some(element) = self.close_button.take() else {
+        let Some(closer) = self.closer.take() else {
             return Ok(None);
         };
-        let result = unsafe { perform_action(element as AXUIElementRef, "AXPress") };
-        unsafe { CFRelease(element as CFTypeRef) };
-        if result == kAXErrorSuccess {
+        if press_closer(closer) {
             return Ok(Some(true));
         }
         let product_name = self.descriptor.product_name;
@@ -1360,7 +1500,7 @@ impl SetupUiHandle {
             BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
-                    "{}'s exact temporary-tab Close action became stale before AXPress",
+                    "{}'s exact temporary-tab close action did not close the tab",
                     product_name
                 ),
             ),
@@ -1370,18 +1510,15 @@ impl SetupUiHandle {
     /// Close the temporary setup tab. `None` means the approved window was
     /// already displaying the exact setup page and no tab was opened.
     pub fn close(mut self) -> Option<bool> {
-        let element = self.close_button.take()?;
-        let result = unsafe { perform_action(element as AXUIElementRef, "AXPress") };
-        unsafe { CFRelease(element as CFTypeRef) };
-        Some(result == kAXErrorSuccess)
+        let closer = self.closer.take()?;
+        Some(press_closer(closer))
     }
 }
 
 impl Drop for SetupUiHandle {
     fn drop(&mut self) {
-        if let Some(element) = self.close_button.take() {
-            let _ = unsafe { perform_action(element as AXUIElementRef, "AXPress") };
-            unsafe { CFRelease(element as CFTypeRef) };
+        if let Some(closer) = self.closer.take() {
+            let _ = press_closer(closer);
         }
     }
 }
@@ -1448,7 +1585,7 @@ fn set_remote_debugging(
     let mut handle = match initial_checkbox {
         Ok(Some(_)) => SetupUiHandle {
             descriptor,
-            close_button: None,
+            closer: None,
             enable_attempted: false,
             trusted_checkbox_fallback_attempted: false,
             pixel_checkbox_attempts: 0,
@@ -1494,7 +1631,13 @@ fn set_remote_debugging(
             let deadline = Instant::now() + Duration::from_secs(2);
             let (created, close_button) = loop {
                 let created = walk_tree(pid, Some(window_id), None);
-                match new_tab_close_button(&initial.nodes, &created.nodes, descriptor) {
+                match new_tab_close_button(
+                    &initial.nodes,
+                    &created.nodes,
+                    descriptor,
+                    pid,
+                    window_id,
+                ) {
                     Ok(Some(element)) => break (created, element),
                     Ok(None) if Instant::now() < deadline => {
                         release_actionable_nodes(&created.nodes);
@@ -1534,7 +1677,7 @@ fn set_remote_debugging(
             release_actionable_nodes(&initial.nodes);
             let mut handle = SetupUiHandle {
                 descriptor,
-                close_button: Some(close_button),
+                closer: Some(close_button),
                 enable_attempted: false,
                 trusted_checkbox_fallback_attempted: false,
                 pixel_checkbox_attempts: 0,
@@ -2314,18 +2457,33 @@ mod tests {
     #[test]
     fn helium_address_field_may_read_either_spelling_of_the_fixed_setup_url() {
         let helium = helium();
-        assert!(setup_url_matches(helium, "helium://inspect/#remote-debugging"));
-        assert!(setup_url_matches(helium, " HELIUM://inspect/#remote-debugging "));
-        assert!(setup_url_matches(helium, "chrome://inspect/#remote-debugging"));
+        assert!(setup_url_matches(
+            helium,
+            "helium://inspect/#remote-debugging"
+        ));
+        assert!(setup_url_matches(
+            helium,
+            " HELIUM://inspect/#remote-debugging "
+        ));
+        assert!(setup_url_matches(
+            helium,
+            "chrome://inspect/#remote-debugging"
+        ));
         assert!(!setup_url_matches(helium, "helium://inspect/"));
-        assert!(!setup_url_matches(helium, "helium://inspect/#remote-debugging/x"));
+        assert!(!setup_url_matches(
+            helium,
+            "helium://inspect/#remote-debugging/x"
+        ));
         assert!(!setup_url_matches(helium, "https://example.test/"));
         // The alias is Helium-only: Chrome and Edge keep their exact URL.
         assert!(!setup_url_matches(
             setup_descriptor(BrowserProduct::MicrosoftEdge).unwrap(),
             "chrome://inspect/#remote-debugging"
         ));
-        assert!(!setup_url_matches(chrome(), "helium://inspect/#remote-debugging"));
+        assert!(!setup_url_matches(
+            chrome(),
+            "helium://inspect/#remote-debugging"
+        ));
     }
 
     #[test]
@@ -2340,7 +2498,12 @@ mod tests {
                 Some("chrome://inspect/#remote-debugging"),
                 &["AXPress"],
             ),
-            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
+            node(
+                "AXCheckBox",
+                Some(helium.checkbox_label),
+                None,
+                &["AXPress"],
+            ),
         ];
         assert_eq!(
             exact_setup_checkbox(&tree(nodes.clone()), helium).unwrap(),
@@ -2354,7 +2517,10 @@ mod tests {
         );
         let mut wrong_url = nodes;
         wrong_url[2].value = Some("https://example.test/".to_owned());
-        assert_eq!(exact_setup_checkbox(&tree(wrong_url), helium).unwrap(), None);
+        assert_eq!(
+            exact_setup_checkbox(&tree(wrong_url), helium).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2371,8 +2537,18 @@ mod tests {
                 Some(helium.setup_url),
                 &["AXPress"],
             ),
-            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
-            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
+            node(
+                "AXCheckBox",
+                Some(helium.checkbox_label),
+                None,
+                &["AXPress"],
+            ),
+            node(
+                "AXCheckBox",
+                Some(helium.checkbox_label),
+                None,
+                &["AXPress"],
+            ),
         ];
         nodes[3].element_ptr = first.0 as usize;
         nodes[4].element_ptr = second.0 as usize;
@@ -3009,7 +3185,7 @@ mod tests {
         assert_eq!(
             select_new_tab_close_button(&before, &after, |left, right| left == right, chrome(),)
                 .unwrap(),
-            Some(21)
+            Some(CloseTarget::Button(21))
         );
     }
 
@@ -3054,7 +3230,7 @@ mod tests {
                 chrome(),
             )
             .unwrap(),
-            Some(21)
+            Some(CloseTarget::Button(21))
         );
     }
 
@@ -3068,6 +3244,131 @@ mod tests {
         let error = select_new_tab_close_button(&[], &after, |l, r| l == r, chrome()).unwrap_err();
         assert_eq!(error.code, BrowserRefusalCode::BrowserWrongTargetRefused);
         assert!(error.message.contains("multiple Close buttons"));
+    }
+
+    #[test]
+    fn helium_tab_without_a_close_button_is_closed_by_key() {
+        // Helium's vertical tab strip exposes tabs as childless radio buttons;
+        // close controls are drawn on hover only.
+        let before = vec![
+            tree_node("AXRadioButton", Some("Original"), 10, 3),
+            tree_node("AXRadioButton", Some("Other"), 11, 3),
+        ];
+        let after = vec![
+            tree_node("AXRadioButton", Some("Original"), 10, 3),
+            tree_node("AXRadioButton", Some("Other"), 11, 3),
+            tree_node("AXRadioButton", Some("New Tab"), 20, 3),
+            tree_node("AXButton", Some("New Tab"), 21, 3),
+        ];
+        assert_eq!(
+            select_new_tab_close_button(&before, &after, |l, r| l == r, helium()).unwrap(),
+            Some(CloseTarget::ActiveTab(20))
+        );
+    }
+
+    #[test]
+    fn helium_still_prefers_an_exact_close_button_when_one_is_exposed() {
+        let after = vec![
+            tree_node("AXRadioButton", Some("New Tab"), 20, 1),
+            tree_node("AXButton", Some("Close"), 21, 2),
+        ];
+        assert_eq!(
+            select_new_tab_close_button(&[], &after, |l, r| l == r, helium()).unwrap(),
+            Some(CloseTarget::Button(21))
+        );
+    }
+
+    #[test]
+    fn products_other_than_helium_still_refuse_a_tab_without_a_close_button() {
+        let after = vec![tree_node("AXRadioButton", Some("New Tab"), 20, 1)];
+        let error = select_new_tab_close_button(&[], &after, |l, r| l == r, chrome()).unwrap_err();
+        assert_eq!(error.code, BrowserRefusalCode::BrowserWrongTargetRefused);
+        assert!(error.message.contains("no exact Close button"));
+    }
+
+    #[test]
+    fn close_tab_key_requires_the_new_tab_to_be_the_only_selected_tab() {
+        let same = |l: usize, r: usize| l == r;
+        let tabs = [(10, Some(false)), (11, Some(false)), (20, Some(true))];
+        assert!(active_tab_close_proven(
+            &tabs,
+            20,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
+        // Another tab is the selected one: the key would close it.
+        assert!(!active_tab_close_proven(
+            &tabs,
+            10,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
+        let other_selected = [(10, Some(true)), (11, Some(false)), (20, Some(false))];
+        assert!(!active_tab_close_proven(
+            &other_selected,
+            20,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
+        // Two selected tabs, or an unreadable one, are never proof.
+        let two = [(10, Some(true)), (20, Some(true))];
+        assert!(!active_tab_close_proven(
+            &two,
+            20,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
+        let unknown = [(10, None), (20, Some(true))];
+        assert!(!active_tab_close_proven(
+            &unknown,
+            20,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
+    }
+
+    #[test]
+    fn close_tab_key_requires_the_exact_window_and_never_the_last_tab() {
+        let same = |l: usize, r: usize| l == r;
+        let tabs = [(10, Some(false)), (20, Some(true))];
+        // A sibling window is key or main: the key would land there.
+        assert!(!active_tab_close_proven(
+            &tabs,
+            20,
+            same,
+            Some(8),
+            Some(7),
+            7
+        ));
+        assert!(!active_tab_close_proven(
+            &tabs,
+            20,
+            same,
+            Some(7),
+            Some(8),
+            7
+        ));
+        assert!(!active_tab_close_proven(&tabs, 20, same, None, Some(7), 7));
+        assert!(!active_tab_close_proven(&tabs, 20, same, Some(7), None, 7));
+        // With one tab the key would close the whole window.
+        assert!(!active_tab_close_proven(
+            &[(20, Some(true))],
+            20,
+            same,
+            Some(7),
+            Some(7),
+            7
+        ));
     }
 
     #[test]

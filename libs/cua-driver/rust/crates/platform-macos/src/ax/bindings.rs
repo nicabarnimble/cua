@@ -565,6 +565,23 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<super::exact_target::AxWindo
     }
 }
 
+/// The application's main AX window id (`AXMainWindow`), the window AppKit
+/// resolves document-style commands such as Close Tab against.
+pub fn main_window_id_of_pid(pid: i32) -> Option<super::exact_target::AxWindowId> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let window = copy_element_attr(app, "AXMainWindow");
+        CFRelease(app as CFTypeRef);
+        let window = window?;
+        let window_id = super::exact_target::owning_window_id(window);
+        CFRelease(window as CFTypeRef);
+        window_id
+    }
+}
+
 /// Put `pid`'s focused window (else its main window) back on top of the
 /// window order through the app's own `AXRaise`.
 ///
