@@ -22,7 +22,7 @@ use cua_driver_core::browser::types::{
     NativeOwnershipProof, NativeWindowInfo, OwnedEndpoint, ProcessFingerprint, Rect,
 };
 use cua_driver_core::browser::{
-    existing_profile_setup_descriptor, fetch_json_version_ws_url, is_firefox,
+    fetch_json_version_ws_url, is_firefox,
     loopback_websocket_port, parse_devtools_active_port, BrowserCursorTracker,
 };
 use serde::Serialize;
@@ -1179,7 +1179,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         request: ExistingProfileSetupRequest,
     ) -> Result<ExistingProfileSetupOutcome, BrowserRefusal> {
-        let descriptor = existing_profile_setup_descriptor(request.browser).ok_or_else(|| {
+        let descriptor = super::setup_ui::setup_descriptor(request.browser).ok_or_else(|| {
             BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!(
@@ -1370,7 +1370,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         request: ExistingProfileSetupRequest,
     ) -> Result<bool, BrowserRefusal> {
-        let descriptor = existing_profile_setup_descriptor(request.browser).ok_or_else(|| {
+        let descriptor = super::setup_ui::setup_descriptor(request.browser).ok_or_else(|| {
             BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!(

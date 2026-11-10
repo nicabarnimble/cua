@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Exact macOS setup for Chrome's per-instance remote-debugging toggle.
+//! Exact macOS setup for Chrome's per-instance remote-debugging toggle
+//! (Chrome, Chromium, Edge, and Helium).
 
 use std::time::{Duration, Instant};
 use std::{
@@ -22,6 +23,48 @@ use crate::ax::bindings::{
 use crate::ax::tree::{
     walk_native_chrome_bounded, walk_tree, AXNode, TreeWalkResult, DEFAULT_MAX_ELEMENTS,
 };
+
+/// Helium: Chromium fork whose internal pages use the `helium://` scheme.
+/// Its `inspect` page is Chromium's unchanged remote-debugging UI (same page
+/// title, heading, and per-instance checkbox), so the Chrome setup path is
+/// reused with Helium's own URL. The address field may still render the
+/// Chromium-internal spelling, so both spellings of the fixed URL are read as
+/// the setup page; the URL typed is always the `helium://` one.
+const HELIUM_TITLES: &[&str] = &[
+    "Inspect with Helium Developer Tools",
+    "Inspect with Chromium Developer Tools",
+    "Inspect with Chrome Developer Tools",
+];
+const HELIUM_SETUP_URL_ALIASES: &[&str] = &["chrome://inspect/#remote-debugging"];
+static HELIUM_DESCRIPTOR: BrowserSetupDescriptor = BrowserSetupDescriptor {
+    product: BrowserProduct::Helium,
+    product_name: "Helium",
+    setup_url: "helium://inspect/#remote-debugging",
+    page_titles: HELIUM_TITLES,
+    page_heading: "Remote debugging",
+    checkbox_label: "Allow remote debugging for this browser instance",
+    tab_close_labels: &["Close"],
+};
+
+/// The approved existing-profile setup descriptor for `product` on macOS:
+/// the shared Chrome, Chromium, and Edge descriptors plus Helium.
+pub(super) fn setup_descriptor(product: BrowserProduct) -> Option<&'static BrowserSetupDescriptor> {
+    if product == BrowserProduct::Helium {
+        return Some(&HELIUM_DESCRIPTOR);
+    }
+    cua_driver_core::browser::existing_profile_setup_descriptor(product)
+}
+
+/// Whether an address-field value is the descriptor's fixed setup URL (or,
+/// for Helium, its Chromium-internal spelling).
+fn setup_url_matches(descriptor: &BrowserSetupDescriptor, value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case(descriptor.setup_url)
+        || (descriptor.product == BrowserProduct::Helium
+            && HELIUM_SETUP_URL_ALIASES
+                .iter()
+                .any(|alias| value.eq_ignore_ascii_case(alias)))
+}
 
 fn field_equals(node: &AXNode, expected: &str) -> bool {
     [
@@ -155,7 +198,7 @@ fn omnibox_reads_setup_url(nodes: &[AXNode], descriptor: &BrowserSetupDescriptor
             && node
                 .value
                 .as_deref()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+                .is_some_and(|value| setup_url_matches(descriptor, &value))
     })
 }
 
@@ -195,7 +238,7 @@ fn native_setup_page_proven(nodes: &[AXNode], descriptor: &BrowserSetupDescripto
                 && node
                     .value
                     .as_deref()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+                    .is_some_and(|value| setup_url_matches(descriptor, &value))
         }),
         is_same_element,
     )
@@ -233,7 +276,7 @@ fn native_setup_page_committed(
             && node
                 .value
                 .as_deref()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+                .is_some_and(|value| setup_url_matches(descriptor, &value))
     });
     let Some(exact_omnibox) = exact_omnibox else {
         return false;
@@ -315,7 +358,7 @@ fn exact_omnibox_suggestion(
                 && node
                     .value
                     .as_deref()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+                    .is_some_and(|value| setup_url_matches(descriptor, &value))
         }),
         is_same_element,
     )
@@ -878,7 +921,7 @@ fn exact_pixel_setup_checkbox(
                 && node
                     .value
                     .as_deref()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+                    .is_some_and(|value| setup_url_matches(descriptor, &value))
         }),
         is_same_element,
     )
@@ -1548,7 +1591,7 @@ fn set_remote_debugging(
                 ));
             }
             let exact_value = unsafe { copy_string_attr(omnibox as AXUIElementRef, "AXValue") }
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url));
+                .is_some_and(|value| setup_url_matches(descriptor, &value));
             let can_confirm = created
                 .nodes
                 .iter()
@@ -1677,7 +1720,7 @@ fn set_remote_debugging(
                                     copy_string_attr(omnibox as AXUIElementRef, "AXValue")
                                 }
                                 .is_some_and(|value| {
-                                    value.trim().eq_ignore_ascii_case(descriptor.setup_url)
+                                    setup_url_matches(descriptor, &value)
                                 });
                                 if !exact_value {
                                     anyhow::bail!(
@@ -2226,6 +2269,116 @@ mod tests {
         assert_eq!(
             exact_setup_checkbox(&tree(wrong_url), chrome()).unwrap(),
             None
+        );
+    }
+
+    fn helium() -> &'static BrowserSetupDescriptor {
+        setup_descriptor(BrowserProduct::Helium).unwrap()
+    }
+
+    #[test]
+    fn helium_setup_uses_its_own_scheme_and_chromiums_unchanged_inspect_page() {
+        let helium = helium();
+        assert_eq!(helium.product, BrowserProduct::Helium);
+        assert_eq!(helium.setup_url, "helium://inspect/#remote-debugging");
+        // Chromium's WebUI labels are what Helium ships; they must match what
+        // the Chrome path already anchors on.
+        assert_eq!(helium.page_heading, chrome().page_heading);
+        assert_eq!(helium.checkbox_label, chrome().checkbox_label);
+        assert!(helium.page_titles.contains(&chrome().page_titles[0]));
+    }
+
+    #[test]
+    fn descriptor_lookup_adds_helium_without_changing_the_other_products() {
+        for product in [
+            BrowserProduct::GoogleChrome,
+            BrowserProduct::Chromium,
+            BrowserProduct::MicrosoftEdge,
+        ] {
+            assert_eq!(
+                setup_descriptor(product),
+                existing_profile_setup_descriptor(product)
+            );
+        }
+        for product in [
+            BrowserProduct::Brave,
+            BrowserProduct::Firefox,
+            BrowserProduct::Safari,
+            BrowserProduct::Electron,
+            BrowserProduct::Other,
+        ] {
+            assert!(setup_descriptor(product).is_none());
+        }
+    }
+
+    #[test]
+    fn helium_address_field_may_read_either_spelling_of_the_fixed_setup_url() {
+        let helium = helium();
+        assert!(setup_url_matches(helium, "helium://inspect/#remote-debugging"));
+        assert!(setup_url_matches(helium, " HELIUM://inspect/#remote-debugging "));
+        assert!(setup_url_matches(helium, "chrome://inspect/#remote-debugging"));
+        assert!(!setup_url_matches(helium, "helium://inspect/"));
+        assert!(!setup_url_matches(helium, "helium://inspect/#remote-debugging/x"));
+        assert!(!setup_url_matches(helium, "https://example.test/"));
+        // The alias is Helium-only: Chrome and Edge keep their exact URL.
+        assert!(!setup_url_matches(
+            setup_descriptor(BrowserProduct::MicrosoftEdge).unwrap(),
+            "chrome://inspect/#remote-debugging"
+        ));
+        assert!(!setup_url_matches(chrome(), "helium://inspect/#remote-debugging"));
+    }
+
+    #[test]
+    fn helium_checkbox_requires_exact_internal_page_proof() {
+        let helium = helium();
+        let nodes = vec![
+            node("AXWebArea", Some(helium.page_titles[2]), None, &[]),
+            node("AXHeading", Some(helium.page_heading), None, &[]),
+            node(
+                "AXTextField",
+                Some("Address and search bar"),
+                Some("chrome://inspect/#remote-debugging"),
+                &["AXPress"],
+            ),
+            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
+        ];
+        assert_eq!(
+            exact_setup_checkbox(&tree(nodes.clone()), helium).unwrap(),
+            Some(7)
+        );
+        let mut own_scheme = nodes.clone();
+        own_scheme[2].value = Some(helium.setup_url.to_owned());
+        assert_eq!(
+            exact_setup_checkbox(&tree(own_scheme), helium).unwrap(),
+            Some(7)
+        );
+        let mut wrong_url = nodes;
+        wrong_url[2].value = Some("https://example.test/".to_owned());
+        assert_eq!(exact_setup_checkbox(&tree(wrong_url), helium).unwrap(), None);
+    }
+
+    #[test]
+    fn helium_checkbox_matcher_refuses_ambiguity() {
+        let helium = helium();
+        let first = ApplicationElement::new(std::process::id() as i32);
+        let second = ApplicationElement::new(std::process::id() as i32 + 1);
+        let mut nodes = vec![
+            node("AXWebArea", Some(helium.page_titles[0]), None, &[]),
+            node("AXHeading", Some(helium.page_heading), None, &[]),
+            node(
+                "AXTextField",
+                Some("Address and search bar"),
+                Some(helium.setup_url),
+                &["AXPress"],
+            ),
+            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
+            node("AXCheckBox", Some(helium.checkbox_label), None, &["AXPress"]),
+        ];
+        nodes[3].element_ptr = first.0 as usize;
+        nodes[4].element_ptr = second.0 as usize;
+        assert_eq!(
+            exact_setup_checkbox(&tree(nodes), helium).unwrap_err().code,
+            BrowserRefusalCode::BrowserWrongTargetRefused
         );
     }
 
