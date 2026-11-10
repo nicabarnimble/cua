@@ -1409,7 +1409,17 @@ impl BrowserEngine {
                     "multiple CDP targets match the native window and the title \
                      tie-break cannot pick a unique one",
                 )
-                .with_detail(json!({ "candidate_count": candidate_count })));
+                .with_detail(json!({
+                    "candidate_count": candidate_count,
+                    "native_window_title": native.title,
+                    "candidate_titles": candidates
+                        .iter()
+                        .map(|candidate| json!({
+                            "cdp_window_id": candidate.cdp_window_id,
+                            "title": candidate.title,
+                        }))
+                        .collect::<Vec<_>>(),
+                })));
             }
             BindingOutcome::None => {
                 let only_native_window = self

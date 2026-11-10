@@ -85,8 +85,37 @@ pub fn cardinality_exact_candidate(
 /// Whether the native window title plausibly displays this tab's title.
 /// Browsers render "<tab title> - <product>", so containment (not
 /// equality) is the tie-break; empty tab titles never match.
+///
+/// macOS WindowServer reports long window titles middle-elided
+/// (`"Start of a long ti…end of the title"`), so a long tab title is never a
+/// substring of its own window's native title. An elided native title matches
+/// a tab title that begins with the part before the ellipsis and whose final
+/// characters appear in the part after it (a ` - <product>` suffix may follow).
+/// Uniqueness is still required downstream, so a collision refuses instead of
+/// guessing.
 fn title_matches(native_title: &str, candidate_title: &str) -> bool {
-    !candidate_title.is_empty() && native_title.contains(candidate_title)
+    if candidate_title.is_empty() {
+        return false;
+    }
+    if native_title.contains(candidate_title) {
+        return true;
+    }
+    let Some((head, tail)) = native_title.split_once('…') else {
+        return false;
+    };
+    const TAIL_PROBE_CHARS: usize = 16;
+    let candidate_chars = candidate_title.chars().count();
+    if head.chars().count() < TAIL_PROBE_CHARS
+        || tail.chars().count() < TAIL_PROBE_CHARS
+        || candidate_chars <= head.chars().count()
+    {
+        return false;
+    }
+    let probe: String = candidate_title
+        .chars()
+        .skip(candidate_chars - TAIL_PROBE_CHARS)
+        .collect();
+    candidate_title.starts_with(head) && tail.contains(&probe)
 }
 
 /// Prove the selected page in one already-correlated browser window without
@@ -261,6 +290,52 @@ mod tests {
         width: 640.0,
         height: 480.0,
     };
+
+    #[test]
+    fn middle_elided_native_title_matches_the_full_tab_title() {
+        let tab = "LumenPnP - Accurate and Reliable Pick and Place Machine \u{2013} Opulo";
+        let elided = "LumenPnP - Accurate and Reliab\u{2026}ick and Place Machine \u{2013} Opulo";
+        assert!(title_matches(elided, tab));
+        // A trailing product suffix after the tab title does not defeat it.
+        assert!(title_matches(
+            "LumenPnP - Accurate and Reliab\u{2026}ick and Place Machine \u{2013} Opulo - Helium",
+            tab
+        ));
+        // A different long title with the same start but another ending, a
+        // different start, or a too-short fragment never matches.
+        assert!(!title_matches(
+            elided,
+            "LumenPnP - Accurate and Reliable Pick and Place Robot Kit \u{2013} Opulo"
+        ));
+        assert!(!title_matches(
+            elided,
+            "Other - Accurate and Reliable Pick and Place Machine \u{2013} Opulo"
+        ));
+        assert!(!title_matches("Lumen\u{2026}Opulo", tab));
+        assert!(!title_matches(elided, ""));
+    }
+
+    #[test]
+    fn elided_titles_pick_one_of_several_stacked_windows() {
+        let tab = "LumenPnP - Accurate and Reliable Pick and Place Machine \u{2013} Opulo";
+        let native = native(
+            "LumenPnP - Accurate and Reliab\u{2026}ick and Place Machine \u{2013} Opulo",
+            B,
+        );
+        let mut lumen = cand("lumen", tab, B);
+        lumen.cdp_window_id = Some(1);
+        let mut mail = cand("mail", "Inbox - Mail", B);
+        mail.cdp_window_id = Some(2);
+        let mut chat = cand("chat", "ChatGPT", B);
+        chat.cdp_window_id = Some(3);
+        match correlate(&native, &[mail, lumen, chat], 4.0) {
+            BindingOutcome::Bound { candidate, quality } => {
+                assert_eq!(candidate.cdp_target_id, "lumen");
+                assert_eq!(quality, BindingQuality::Exact);
+            }
+            other => panic!("expected the lumen window, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unique_bounds_match_is_exact() {
